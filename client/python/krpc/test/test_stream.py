@@ -164,6 +164,26 @@ class TestStream(ServerTestCase, unittest.TestCase):
         self.assertEqual('42', s0())
         self.assertEqual('42', s1())
 
+        s2 = self.conn.add_stream(
+            self.conn.test_service.int32_to_string, 43)
+        self.assertNotEqual(stream_id, s2._stream_id)
+        self.assertEqual('42', s0())
+        self.assertEqual('42', s1())
+        self.assertEqual('43', s2())
+        self.wait()
+        self.assertEqual('42', s0())
+        self.assertEqual('42', s1())
+        self.assertEqual('43', s2())
+
+    def test_wait(self):
+        with self.conn.acquired_stream(self.conn.test_service.counter) as x:
+            count = x()
+            self.assertTrue(count < 10)
+            while count < 10:
+                x.wait()
+                count += 1
+                self.assertEqual(count, x())
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -28,8 +28,9 @@ namespace KRPC
         IDictionary<Guid, IClient<NoMessage, StreamUpdate>> streamClients = new Dictionary<Guid, IClient<NoMessage, StreamUpdate>> ();
         RoundRobinScheduler<IClient<Request,Response>> clientScheduler = new RoundRobinScheduler<IClient<Request, Response>> ();
         List<RequestContinuation> continuations = new List<RequestContinuation> ();
-        IDictionary<IClient<NoMessage,StreamUpdate>, IList<StreamRequest>> streamRequests = new Dictionary<IClient<NoMessage,StreamUpdate>,IList<StreamRequest>> ();
-        IDictionary<ulong, object> streamResultCache = new Dictionary<ulong, object> ();
+        IDictionary<IClient<NoMessage,StreamUpdate>, IDictionary<ulong, Service.Stream>> streams = new Dictionary<IClient<NoMessage,StreamUpdate>,IDictionary<ulong, Service.Stream>> ();
+        IList<Utils.Tuple<IClient<NoMessage,StreamUpdate>, ulong>> removeStreams = new List<Utils.Tuple<IClient<NoMessage,StreamUpdate>, ulong>> ();
+        ulong nextStreamId = 0;
 
         static Core instance;
 
@@ -91,13 +92,16 @@ namespace KRPC
         internal void StreamClientConnected (IClient<NoMessage,StreamUpdate> client)
         {
             streamClients [client.Guid] = client;
-            streamRequests [client] = new List<StreamRequest> ();
+            streams [client] = new Dictionary<ulong, Service.Stream> ();
         }
 
         internal void StreamClientDisconnected (IClient<NoMessage,StreamUpdate> client)
         {
+            // Note: convert list of streams to remove to array as
+            // RemoveStreamInternal modifies the collection
+            foreach (var id in streams [client].Keys.ToArray ())
+                RemoveStreamInternal (client, id);
             streamClients.Remove (client.Guid);
-            streamRequests.Remove (client);
         }
 
         /// <summary>
@@ -331,7 +335,6 @@ namespace KRPC
             TimePerRPCUpdate = 0;
             ExecTimePerRPCUpdate = 0;
             PollTimePerRPCUpdate = 0;
-            StreamRPCs = 0;
             StreamRPCsExecuted = 0;
             TimePerStreamUpdate = 0;
         }
@@ -502,95 +505,98 @@ namespace KRPC
             for (int i = 0; i < Servers.Count; i++)
                 Servers [i].StreamServer.Update ();
 
-            // Run streaming requests
-            if (streamRequests.Count > 0) {
-                foreach (var entry in streamRequests) {
+            if (streams.Count > 0) {
+                foreach (var entry in streams) {
                     var streamClient = entry.Key;
                     var id = streamClient.Guid;
-                    var requests = entry.Value;
-                    if (requests.Count == 0)
+                    var clientStreams = entry.Value.Values;
+                    if (clientStreams.Count == 0)
                         continue;
                     if (!rpcClients.ContainsKey (id))
                         continue;
                     CallContext.Set (rpcClients [id]);
-                    var streamUpdate = new StreamUpdate ();
-                    foreach (var request in requests) {
-                        // Run the RPC
-                        ProcedureResult result;
-                        try {
-                            result = Service.Services.Instance.ExecuteCall (request.Procedure, request.Arguments);
-                        } catch (RPCException e) {
-                            result = new ProcedureResult ();
-                            result.Error = HandleException (e);
-                        } catch (YieldException e) {
-                            // FIXME: handle yields correctly
-                            result = new ProcedureResult ();
-                            result.Error = HandleException (e);
-                        }
-                        rpcsExecuted++;
-                        // Don't send an update if it is the previous one
-                        // FIXME: does the following comparison work?!? The objects have not been serialized
-                        if (result.Value == streamResultCache [request.Identifier])
-                            continue;
-                        // Add the update to the response message
-                        streamResultCache [request.Identifier] = result.Value;
-                        var streamResult = request.Result;
-                        streamResult.Result = result;
-                        streamUpdate.Results.Add (streamResult);
+                    // Update streams
+                    bool changed = false;
+                    foreach (var stream in clientStreams) {
+                      stream.Update ();
+                      changed |= stream.Changed;
                     }
-                    if (streamUpdate.Results.Count > 0)
+                    // If anything changed, produce an update
+                    if (changed) {
+                        var streamUpdate = new StreamUpdate ();
+                        foreach (var stream in clientStreams)
+                            if (stream.Changed)
+                                streamUpdate.Results.Add (stream.StreamResult);
                         streamClient.Stream.Write (streamUpdate);
+                        Logger.WriteLine ("Sent stream update to client " + streamClient.Address, Logger.Severity.Debug);
+                        foreach (var stream in clientStreams)
+                            if (stream.Changed)
+                                stream.Sent ();
+                    }
                 }
             }
 
+            if (removeStreams.Count > 0) {
+                foreach (var entry in removeStreams)
+                    RemoveStreamInternal (entry.Item1, entry.Item2);
+                removeStreams.Clear ();
+            }
+
             streamTimer.Stop ();
-            StreamRPCs = rpcsExecuted;
             StreamRPCsExecuted += rpcsExecuted;
             TimePerStreamUpdate = (float)streamTimer.ElapsedSeconds ();
         }
 
         /// <summary>
-        /// Add a stream to the server
+        /// Add a stream to the server.
         /// </summary>
-        internal ulong AddStream (IClient rpcClient, ProcedureCall call)
+        internal ulong AddStream (IClient rpcClient, Service.Stream stream, bool requireNew = true)
         {
             var id = rpcClient.Guid;
             if (!streamClients.ContainsKey (id))
                 throw new InvalidOperationException ("No stream client is connected for this RPC client");
             var streamClient = streamClients [id];
 
-            // Check for an existing stream for the request
-            var services = Service.Services.Instance;
-            var procedure = services.GetProcedureSignature (call.Service, call.Procedure);
-            var arguments = services.GetArguments (procedure, call.Arguments);
-            foreach (var streamRequest in streamRequests[streamClient]) {
-                if (streamRequest.Procedure == procedure && streamRequest.Arguments.SequenceEqual (arguments))
-                    return streamRequest.Identifier;
+            foreach (var entry in streams [streamClient]) {
+                if (stream == entry.Value) {
+                    if (requireNew)
+                        throw new ArgumentException ("Stream already exists", nameof (stream));
+                    return entry.Key;
+                }
             }
 
-            // Create a new stream
-            {
-                var streamRequest = new StreamRequest (call);
-                streamRequests [streamClient].Add (streamRequest);
-                streamResultCache [streamRequest.Identifier] = null;
-                return streamRequest.Identifier;
-            }
+            stream.Id = nextStreamId;
+            nextStreamId++;
+
+            var streamId = stream.Id;
+            streams [streamClient] [streamId] = stream;
+            Logger.WriteLine ("Added stream for client " + streamClient.Address, Logger.Severity.Debug);
+            StreamRPCs++;
+            return streamId;
         }
 
         /// <summary>
         /// Remove a stream from the server
         /// </summary>
-        internal void RemoveStream (IClient rpcClient, ulong identifier)
+        internal void RemoveStream (IClient rpcClient, ulong streamId)
         {
             var id = rpcClient.Guid;
             if (!streamClients.ContainsKey (id))
                 throw new InvalidOperationException ("No stream client is connected for this RPC client");
             var streamClient = streamClients [id];
-            var requests = streamRequests [streamClient].Where (x => x.Identifier == identifier).ToList ();
-            if (!requests.Any ())
+            var clientStreams = streams [streamClient];
+            if (!clientStreams.ContainsKey (streamId))
                 return;
-            streamRequests [streamClient].Remove (requests.Single ());
-            streamResultCache.Remove (identifier);
+            removeStreams.Add (new Utils.Tuple<IClient<NoMessage,StreamUpdate>, ulong> (streamClient, streamId));
+        }
+
+        private void RemoveStreamInternal (IClient<NoMessage,StreamUpdate> client, ulong id)
+        {
+            if (streams [client].ContainsKey (id)) {
+                streams [client].Remove (id);
+                Logger.WriteLine ("Removed stream for client " + client.Address, Logger.Severity.Debug);
+                StreamRPCs--;
+            }
         }
 
         HashSet<IClient<Request,Response>> pollRequestsCurrentClients = new HashSet<IClient<Request, Response>> ();
@@ -681,7 +687,7 @@ namespace KRPC
         /// <summary>
         /// Convert an exception thrown by an RPC into an error message.
         /// </summary>
-        private static Error HandleException(System.Exception exn)
+        internal static Error HandleException(System.Exception exn)
         {
             if (exn is RPCException && exn.InnerException != null)
                 exn = exn.InnerException;

@@ -52,13 +52,11 @@ srcs = glob(['src/**/*.cs']) + [
     ':services-ui'
 ]
 deps = [
-    '//tools/build/mono-4.5:Google.Protobuf',
-    '//tools/build/mono-4.5:mscorlib',
-    '//tools/build/mono-4.5:System',
-    '//tools/build/mono-4.5:System.Core',
-    '//tools/build/mono-4.5:System.Runtime',
-    '//tools/build/mono-4.5:System.IO',
-    '//tools/build/mono-4.5:System.Xml'
+    '//tools/build/ksp:Google.Protobuf',
+    '//tools/build/ksp:mscorlib',
+    '//tools/build/ksp:System',
+    '//tools/build/ksp:System.Core',
+    '//tools/build/ksp:System.Xml'
 ]
 
 csharp_library(
